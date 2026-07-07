@@ -39,27 +39,33 @@ python -m PyInstaller --noconfirm MeshCommandPost.spec
 
 ```
 src/
-  main.py              # Entry point — QApplication setup, high-DPI, Fusion style
-  app.py               # App(QObject) — signal wiring, packet routing, UI flush timer
-  models.py            # MQTTPacket and Node dataclasses + display helpers
-  packet_parser.py     # parse_packet(), extract_node_updates(), compute_packet_hash()
-  storage.py           # Storage(SQLite) — packets + nodes, dedup, migration, export
-  map_decoder.py       # Minimal protobuf parser + AES-CTR decryptor for Map Reports
-  intelligence.py      # Pure functions: node status, haversine distance, enrich_node()
-  production_mqtt.py   # ProductionMqttClient — the ONE authoritative MQTT connection
-  source_manager.py    # SourceConfig, SourceManager — stats scaffold + config storage
-  config_manager.py    # ConfigManager — JSON settings with typed property accessors
-  geocoder.py          # Background Nominatim reverse geocoder, SQLite-cached, 1 req/sec
+  main.py               # Entry point — QApplication setup, high-DPI, Fusion style
+  app.py                # App(QObject) — signal wiring, packet routing, UI flush timer
+  models.py             # MQTTPacket and Node dataclasses + display helpers
+  packet_parser.py      # parse_packet(), extract_node_updates(), compute_packet_hash()
+  storage.py            # Storage(SQLite) — packets + nodes, dedup, migration, export
+  map_decoder.py        # Minimal protobuf parser + AES-CTR decryptor for Map Reports
+  intelligence.py       # Pure functions: node status, haversine distance, enrich_node()
+  production_mqtt.py    # ProductionMqttClient — the ONE authoritative MQTT connection
+  source_manager.py     # SourceConfig, SourceManager — stats scaffold + config storage
+  subscription_registry.py  # SubscriptionRegistry — live sub tracking; DIRECT/ROOT_DERIVED/MAP_TYPE
+  discovery_client.py   # DiscoveryClient — isolated one-shot root discovery (loop_forever on daemon thread)
+  topic_probe_client.py # TopicProbeClient — isolated diagnostic probe (loop_start design)
+  root_classifier.py    # classify_root() / activity_label() — root metadata helpers
+  config_manager.py     # ConfigManager — JSON settings with typed property accessors
+  geocoder.py           # Background Nominatim reverse geocoder, SQLite-cached, 1 req/sec
   reference_importer.py # Import node records from JSON/CSV (MeshMap exports, etc.)
-  registry.py          # NodeRegistry — in-memory node cache, display helpers, stats
+  registry.py           # NodeRegistry — in-memory node cache, display helpers, stats
   ui/
-    main_window.py     # MainWindow — tab container, visibility bar, event log, export
-    packet_feed.py     # Packets tab — incremental insert, filter bar, JSON detail pane
-    node_list.py       # Nodes tab — dirty-flag upsert, filter buttons, context menu
-    map_view.py        # Map tab — Leaflet in QWebEngineView, single-load + JS updates
-    source_panel.py    # Source panel — per-source MQTT status table, Edit dialog
-    message_view.py    # Messages tab — text packets only
-    telemetry_view.py  # Telemetry tab — device + environment metrics
+    main_window.py      # MainWindow — tab container, visibility bar, event log, export
+    packet_feed.py      # Packets tab — incremental insert, filter bar, JSON detail pane
+    node_list.py        # Nodes tab — dirty-flag upsert, filter buttons, context menu
+    map_view.py         # Map tab — Leaflet in QWebEngineView, single-load + JS updates
+    source_panel.py     # Source panel — per-source MQTT status table, Edit dialog
+    root_manager.py     # Root Manager dialog — two-pane discovered/staged/active roots
+    topic_probe_dialog.py # Topic Probe and Live Subs dialogs
+    message_view.py     # Messages tab — text packets only
+    telemetry_view.py   # Telemetry tab — device + environment metrics
 ```
 
 ## Data Storage
@@ -82,6 +88,19 @@ History loaded on startup: last 300 packets, all nodes.
 
 Raw/Advanced source requires explicit confirmation to enable and is for short
 diagnostic sessions only.
+
+## Safe Baseline Mode
+
+`SAFE_MODE_MQTT = True` is a module-level constant in `app.py`. The flag controls:
+
+- **Production path is always fixed** to `msh/US/2/json/#` and `msh/US/2/map/#`. These are never changed by Root Manager, discovery, or probe — in any mode.
+- **Root Manager is fully functional** for browsing, discovery, and staging. Roots move through four states: Discovered → Staged → Auto-connect → Active. In Safe Mode, staging writes to DB but never activates a live MQTT subscription automatically.
+- **Discovery is always allowed.** `start_discovery()` always runs; discovered roots are saved to the DB as Discovered/Staged state only — never auto-activated.
+- The mode banner in the source panel and Root Manager reflects the current state.
+
+When `SAFE_MODE_MQTT = False` (Normal Mode), Root Manager Add/Remove buttons call `subscribe_root()`/`unsubscribe_root()` — the `SourceManager` worker path.
+
+**The production path (`msh/US/2/json/#`, `msh/US/2/map/#`) MUST NOT be changed by any Root Manager action, discovery result, or database load.**
 
 ## Key Architecture Decisions
 
@@ -178,6 +197,15 @@ AES-CTR nonce: `pack('<Q', packet_id) + pack('<Q', from_node)` (16 bytes LE).
   after filtering. Fine for v1.
 - **pycryptodome optional.** Without it, encrypted Map Reports cannot be decrypted.
   Install via `pip install pycryptodome`.
+- **`SubscriptionRegistry.record_packet()` is never called.** The method exists but
+  `_on_prod_packet` in `app.py` updates `source_manager.record_received()` instead of
+  the registry. Packet counts in Root Manager's right pane will therefore always show 0.
+  Not a crash risk, but the display is misleading. Fix by calling `sub_registry.record_packet(topic)`
+  from `_on_prod_packet` when the change is explicitly requested.
+- **`SourceManager.unsubscribe_topics()` does not exist.** Normal Mode "Remove Direct
+  Subscription" in `root_manager._act_remove()` calls `self._app.source_manager.unsubscribe_topics()`
+  which will NameError. This path is never reached in Safe Baseline Mode. Fix before
+  enabling Normal Mode by routing to `unsubscribe_root()` instead.
 
 ## DO NOT BREAK — Critical Lessons Learned
 
@@ -227,6 +255,42 @@ AES-CTR nonce: `pack('<Q', packet_id) + pack('<Q', from_node)` (16 bytes LE).
 15. **Topic Probe is read-only diagnostic only.** The broker, credentials, and topics
     are confirmed working: `msh/US/2/json/#` and `msh/US/2/map/#`. Probe results can
     inform config, but the probe itself never feeds production packet processing.
+16. **Root Manager staging does NOT activate live subscriptions in Safe Mode.** The
+    four root states (Discovered, Staged, Auto-connect, Active) are explicit. Staging
+    writes `staged=1` to the `mqtt_roots` DB table only. Never auto-promote Staged →
+    Active without an explicit user action and Normal Mode enabled.
+17. **`mqtt_client.py` has been deleted.** It was dead code — an old `MQTTClient` using
+    `loop_forever()` that was never imported. Do not recreate it. If MQTT connection
+    logic is needed, extend `ProductionMqttClient` or create a properly isolated client.
+
+## No Cowboy Programming Rules
+
+These are permanent engineering discipline requirements for this project. Follow them in every change.
+
+1. **One problem at a time.** Fix the stated issue. Do not clean up adjacent code while fixing a bug, and do not refactor while adding a feature.
+2. **Preserve the known-good baseline.** The baseline is: `msh/US/2/json/#` and `msh/US/2/map/#` connected, MQTT Raw disabled, `SAFE_MODE_MQTT = True`. Never break it.
+3. **No hidden behavior.** No hidden subscriptions, no background discovery, no silent reconnect loops, no silent DB writes from diagnostics, no broad MQTT subscriptions unless explicitly requested.
+4. **Small, testable changes.** Each change should be a single concern. Git-commit after each working change.
+5. **Explain before risky changes.** Architecture changes, threading model changes, MQTT lifecycle changes, SQLite schema changes, Root Manager behavior changes — explain the plan and get agreement first.
+6. **No speculative rewrites.** Do not redesign something that works just because you have a "better idea." Only rewrite when there is a confirmed problem.
+7. **Diagnostics must be isolated.** Diagnostic clients get their own MQTT client, never piggyback on production. They do not write to the `packets`, `nodes`, or `map` tables. They clean up when done.
+8. **One source of truth.** MQTT subscriptions are tracked by `SubscriptionRegistry`. UI renders the actual subscription state — never a cached assumption. `_load_sources()` always sets `db_roots = []`.
+9. **Resource use matters.** Monitor CPU, memory, SQLite locking, DB/WAL growth, UI update rate, MQTT traffic, reconnect timer accumulation, stale threads.
+10. **If uncertain, stop and report.** Add logging, write a minimal diagnostic, reproduce the issue, report findings, then propose the smallest fix. Do not guess.
+
+### Required End-of-Change Checklist
+
+Before marking any task complete, report:
+
+- What exact issue was fixed
+- Files changed (with line numbers for key changes)
+- Whether the safe MQTT baseline still works (`msh/US/2/json/#`, `msh/US/2/map/#`, Raw disabled)
+- Whether Root Manager / discovery / probe were touched
+- Whether any dead code was removed
+- Whether any resource risk remains
+- What was tested
+- What was NOT tested
+- Whether CLAUDE.md was updated
 
 ## Build Checklist
 
