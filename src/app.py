@@ -167,7 +167,6 @@ class App(QObject):
         self.disc_topic:        str             = ""
         self.disc_roots_found:  int             = 0
         self.disc_packets_seen: int             = 0
-        self._disc_was_stopped: bool            = False
         # Test root subscriptions — added on top of the two baseline feeds.
         # Never populated at startup; only via test_subscribe_root().
         self._test_roots: List[str] = []
@@ -511,7 +510,6 @@ class App(QObject):
         self.disc_topic        = DiscoveryClient.DISCOVERY_TOPIC
         self.disc_roots_found  = 0
         self.disc_packets_seen = 0
-        self._disc_was_stopped = False
 
         self._disc_client.start(duration_sec)
         self._disc_countdown_timer.start()
@@ -527,15 +525,70 @@ class App(QObject):
         return True
 
     def stop_discovery(self) -> None:
-        """Cancel discovery early — cleanup completes asynchronously in _on_disc_done."""
+        """Cancel discovery early. Delegates all state/UI cleanup to _finish_discovery."""
         if not self.disc_running:
             return
-        logging.info("Discovery: stop requested")
-        self._disc_was_stopped = True
+        logging.info("Discovery: stop requested by user")
+        self._finish_discovery("stopped")
+
+    def _finish_discovery(self, reason: str) -> None:
+        """Single authoritative cleanup for all discovery exit paths.
+
+        Always runs on the Qt main thread.
+        reason: 'complete' | 'stopped' | 'error'
+
+        Immediately marks discovery as not running and emits the appropriate
+        lifecycle signal so the UI resets without waiting for the background
+        MQTT thread to finish disconnecting.  _on_disc_done() then saves the
+        DB and emits discovery_result when the background thread finally exits.
+        """
+        if not self.disc_running:
+            return   # already cleaned up — guard against double-call
+
         self._disc_countdown_timer.stop()
+
+        # Snapshot counts one last time before stopping the client
         if self._disc_client:
-            self._disc_client.stop()
-        # _on_disc_done() will be called from the discovery thread and finish cleanup
+            try:
+                n_r, n_p = self._disc_client.get_counts()
+                self.disc_roots_found  = n_r
+                self.disc_packets_seen = n_p
+            except Exception:
+                pass
+            # Tell the isolated client to stop — non-blocking.
+            # _on_disc_done() will be called from the background thread shortly.
+            if self._disc_client.running:
+                self._disc_client.stop()
+
+        n_roots   = self.disc_roots_found
+        n_packets = self.disc_packets_seen
+
+        self.disc_running = False   # unblock UI immediately
+
+        if reason == "complete":
+            if n_roots:
+                self.window.log(
+                    f"Discovery complete: {n_roots} root(s) found, {n_packets} packet(s) seen"
+                )
+            else:
+                self.window.log("Discovery complete: no roots found")
+            logging.info("Discovery complete: roots=%d, packets=%d", n_roots, n_packets)
+            self.discovery_finished.emit(n_roots, n_packets)
+        elif reason == "stopped":
+            self.window.log(
+                f"Discovery stopped: {n_roots} root(s) found, {n_packets} packet(s) seen"
+            )
+            logging.info("Discovery stopped: roots=%d, packets=%d", n_roots, n_packets)
+            self.discovery_stopped.emit()
+        else:
+            self.window.log(
+                f"Discovery error ({reason}): {n_roots} root(s), {n_packets} packet(s)"
+            )
+            logging.error(
+                "Discovery error: reason=%s, roots=%d, packets=%d",
+                reason, n_roots, n_packets,
+            )
+            self.discovery_stopped.emit()
 
     @Slot()
     def _disc_tick(self) -> None:
@@ -563,23 +616,30 @@ class App(QObject):
         self.discovery_tick.emit(remaining, self.disc_roots_found, self.disc_packets_seen)
 
         if remaining == 0:
-            self._disc_countdown_timer.stop()
+            # Natural expiry — delegate all state/UI cleanup to the single authoritative method
+            self._finish_discovery("complete")
 
     def _on_disc_log(self, msg: str) -> None:
         """Marshal discovery log message from the worker thread to the main thread."""
         QTimer.singleShot(0, lambda: self.window.log(msg))
 
     def _on_disc_done(self, roots: dict) -> None:
-        """Called from the discovery thread on every exit path (timeout or stop)."""
+        """Called from the discovery thread when the isolated client exits.
+
+        Responsibility: save discovered roots to DB, emit discovery_result.
+        Lifecycle state (disc_running, signals) is handled by _finish_discovery(),
+        which has already run by the time _on_disc_done fires in the normal path.
+        The fallback call to _finish_discovery() handles the edge case where the
+        client exits before the countdown timer reaches zero.
+        """
         def _work():
             try:
-                self._disc_countdown_timer.stop()
+                # Edge case: client exited before countdown reached 0 (e.g. connect error).
+                # _finish_discovery is idempotent — it returns immediately if already done.
+                if self.disc_running:
+                    self._finish_discovery("complete")
 
-                was_stopped        = self._disc_was_stopped
-                self._disc_was_stopped = False
-                n_roots   = len(roots)
-                n_packets = self.disc_packets_seen
-
+                # Save discovered roots to DB
                 for root, data in roots.items():
                     try:
                         self.storage.upsert_mqtt_root(
@@ -592,41 +652,23 @@ class App(QObject):
                     except Exception as exc:
                         logging.warning("upsert_mqtt_root %s: %s", root, exc)
 
+                # Log the actual root names now that we have the full dict
+                if roots:
+                    self.window.log(
+                        "Roots saved: " + ", ".join(sorted(roots.keys()))
+                    )
+
                 all_rows = self.storage.get_all_mqtt_roots()
                 result   = {row["root_topic"]: dict(row) for row in all_rows}
-
-                self.disc_running = False
-
-                if was_stopped:
-                    self.window.log(
-                        f"Discovery stopped. {n_roots} root(s) found, "
-                        f"{n_packets} packet(s) seen."
-                    )
-                    logging.info(
-                        "Discovery stopped: roots=%d, packets=%d", n_roots, n_packets
-                    )
-                    self.discovery_stopped.emit()
-                else:
-                    if n_roots:
-                        self.window.log(
-                            f"Discovery complete: {n_roots} root(s) found — "
-                            + ", ".join(sorted(roots.keys()))
-                        )
-                    else:
-                        self.window.log("Discovery complete: no roots found.")
-                    logging.info(
-                        "Discovery complete: roots=%d, packets=%d", n_roots, n_packets
-                    )
-                    self.discovery_finished.emit(n_roots, n_packets)
-
                 logging.info("Discovery cleanup complete")
                 self.discovery_result.emit(result)
 
             except Exception as exc:
                 logging.error("Discovery _on_disc_done error: %s", exc)
-                self.disc_running      = False
-                self._disc_was_stopped = False
-                self.discovery_stopped.emit()
+                # Last-resort guard: ensure disc_running is never left True
+                if self.disc_running:
+                    self.disc_running = False
+                    self.discovery_stopped.emit()
 
         QTimer.singleShot(0, _work)
 
