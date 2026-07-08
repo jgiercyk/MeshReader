@@ -45,18 +45,19 @@ _L_HEADERS = [
     "First Seen", "Last Seen", "Auto-Conn", "Notes",
 ]
 
-# ── Right pane column indices (Staged / Active roots) — row-selection ────────
+# ── Right pane column indices ─────────────────────────────────────────────────
 _R_ROOT   = 0   # root topic or topic filter label
-_R_STATE  = 1   # Staged / Auto-connect / Active
-_R_AC     = 2   # auto-connect on startup
-_R_SUBS   = 3   # MQTT subscription filter(s) (blank for staged/auto-connect)
-_R_PKTS   = 4   # packets received (0 for staged)
-_R_LAST   = 5   # last packet time (blank for staged)
-_R_SINCE  = 6   # connected since (blank for staged/auto-connect)
+_R_STATE  = 1   # combined state text (Active | Staged | Auto-connect | Staged+AC | …)
+_R_ACTIVE = 2   # ● if currently live in sub_registry
+_R_STAGED = 3   # ● if staged=1 in DB
+_R_AC     = 4   # ● if auto_connect=1 in DB
+_R_SUBS   = 5   # MQTT subscription filter(s) (blank if not active)
+_R_PKTS   = 6   # packets received this session (0 if not active)
+_R_LAST   = 7   # last packet time (blank if not active)
 
 _R_HEADERS = [
-    "Root / Topic", "State", "Auto-Conn",
-    "MQTT Subscription(s)", "Pkts", "Last Pkt", "Connected Since",
+    "Root / Topic", "State", "Active", "Staged", "Auto-Conn",
+    "MQTT Subscription(s)", "Pkts", "Last Pkt",
 ]
 
 
@@ -79,6 +80,22 @@ def _short_dt(val: Optional[str]) -> str:
         date, rest = s.split("T", 1)
         return f"{date} {rest[:5]}"
     return s[:16]
+
+
+def _combined_state(active: bool, staged: bool, ac: bool) -> str:
+    if active and ac:    return "Active + AC"
+    if active:           return "Active"
+    if staged and ac:    return "Staged + AC"
+    if staged:           return "Staged"
+    if ac:               return "Auto-connect"
+    return "—"
+
+
+def _state_fg(active: bool, staged: bool, ac: bool) -> str:
+    if active:  return "#1a7a1a"   # green
+    if staged:  return "#8a5a00"   # amber
+    if ac:      return "#1a4a8a"   # blue
+    return "#555555"
 
 
 class RootManagerDialog(QDialog):
@@ -224,7 +241,7 @@ class RootManagerDialog(QDialog):
         splitter.addWidget(btn_col)
 
         # Right pane
-        right_box = QGroupBox("Staged / Active Roots")
+        right_box = QGroupBox("Active Subscriptions & Staged / Auto-Connect Roots")
         right_lay = QVBoxLayout(right_box)
         right_lay.setContentsMargins(4, 4, 4, 4)
         self._right = self._make_right_table()
@@ -353,8 +370,9 @@ class RootManagerDialog(QDialog):
     def _make_right_table(self) -> QTableWidget:
         t = self._make_table(_R_HEADERS)
         for col, w in [
-            (_R_ROOT, 190), (_R_STATE, 90), (_R_AC, 70),
-            (_R_SUBS, 220), (_R_PKTS, 55), (_R_LAST, 80), (_R_SINCE, 85),
+            (_R_ROOT,   190), (_R_STATE, 110), (_R_ACTIVE, 48),
+            (_R_STAGED,  52), (_R_AC,     70), (_R_SUBS,  200),
+            (_R_PKTS,    50), (_R_LAST,   80),
         ]:
             t.setColumnWidth(col, w)
         return t
@@ -437,131 +455,178 @@ class RootManagerDialog(QDialog):
         )
 
     def _repopulate_right(self, active_roots: Set[str]) -> None:
-        """Populate the right pane with staged, auto-connect, and active roots."""
+        """Populate the right pane with all active, staged, and auto-connect entries."""
         subs      = self._app.sub_registry.get_all()
         src_stats = self._app.source_manager.get_stats(SOURCE_MQTT_JSON)
         connected = src_stats.get("connected", False)
-        cs        = src_stats.get("connected_since")
-        since_str = _short_dt(cs.isoformat() if cs else "") if cs else "—"
+        safe      = getattr(self._app, "safe_mode", False)
 
         db_by_root = {r["root_topic"]: r
                       for r in self._app.storage.get_all_mqtt_roots()}
 
         right_rows: List[dict] = []
+        seen_labels: Set[str]  = set()
 
-        # 1. Active subscriptions from sub_registry
+        # 1. Active subscriptions from sub_registry (the live production feeds)
         seen_roots: Set[str] = set()
         for s in subs:
             if s.sub_type == ROOT_DERIVED and s.parent_root:
                 if s.parent_root not in seen_roots:
                     seen_roots.add(s.parent_root)
-                    derived = [x.topic_filter for x in subs
-                               if x.parent_root == s.parent_root]
-                    db_row  = db_by_root.get(s.parent_root, {})
+                    label  = s.parent_root
+                    db_row = db_by_root.get(label, {})
+                    seen_labels.add(label)
                     right_rows.append({
-                        "label":   s.parent_root,
-                        "state":   "Active",
-                        "sub_key": (s.parent_root, ROOT_DERIVED),
-                        "subs":    derived,
-                        "pkts":    sum(x.packet_count for x in subs
-                                       if x.parent_root == s.parent_root),
-                        "last":    max(
+                        "label":    label,
+                        "active":   True,
+                        "staged":   bool(db_row.get("staged")),
+                        "ac":       bool(db_row.get("auto_connect")),
+                        "sub_type": ROOT_DERIVED,
+                        "subs":     [x.topic_filter for x in subs
+                                     if x.parent_root == s.parent_root],
+                        "pkts":     sum(x.packet_count for x in subs
+                                        if x.parent_root == s.parent_root),
+                        "last":     max(
                             (x.last_packet for x in subs
                              if x.parent_root == s.parent_root
                              and x.last_packet is not None),
                             default=None,
                         ),
-                        "ac":     bool(db_row.get("auto_connect")),
-                        "since":  since_str,
                     })
             elif s.sub_type in (DIRECT, MAP_TYPE, "raw"):
+                label = s.topic_filter
+                seen_labels.add(label)
                 right_rows.append({
-                    "label":   s.topic_filter,
-                    "state":   "Active",
-                    "sub_key": (s.topic_filter, s.sub_type),
-                    "subs":    [s.topic_filter],
-                    "pkts":    s.packet_count,
-                    "last":    s.last_packet,
-                    "ac":      False,
-                    "since":   since_str,
+                    "label":    label,
+                    "active":   True,
+                    "staged":   False,
+                    "ac":       False,
+                    "sub_type": s.sub_type,
+                    "subs":     [s.topic_filter],
+                    "pkts":     s.packet_count,
+                    "last":     s.last_packet,
                 })
 
-        # 2. Staged roots (staged=1, not already active)
+        # 2. Roots that are staged or auto-connect but not already listed as active
         for r in db_by_root.values():
-            if r.get("staged") and r["root_topic"] not in active_roots:
+            label     = r["root_topic"]
+            is_staged = bool(r.get("staged"))
+            is_ac     = bool(r.get("auto_connect"))
+            if label in seen_labels:
+                continue
+            if is_staged or is_ac:
+                seen_labels.add(label)
                 right_rows.append({
-                    "label":   r["root_topic"],
-                    "state":   "Staged",
-                    "sub_key": (r["root_topic"], "staged"),
-                    "subs":    [],
-                    "pkts":    0,
-                    "last":    None,
-                    "ac":      bool(r.get("auto_connect")),
-                    "since":   "",
+                    "label":    label,
+                    "active":   False,
+                    "staged":   is_staged,
+                    "ac":       is_ac,
+                    "sub_type": "root",
+                    "subs":     [],
+                    "pkts":     0,
+                    "last":     None,
                 })
 
-        # 3. Auto-connect roots that are not staged and not active
-        for r in db_by_root.values():
-            if (r.get("auto_connect")
-                    and not r.get("staged")
-                    and r["root_topic"] not in active_roots):
-                right_rows.append({
-                    "label":   r["root_topic"],
-                    "state":   "Auto-connect",
-                    "sub_key": (r["root_topic"], "auto_connect"),
-                    "subs":    [],
-                    "pkts":    0,
-                    "last":    None,
-                    "ac":      True,
-                    "since":   "",
-                })
+        # Sort: active first, then staged, then auto-connect, then alpha
+        def _sort_key(row: dict) -> tuple:
+            if row["active"]: return (0, row["label"])
+            if row["staged"]: return (1, row["label"])
+            return (2, row["label"])
+        right_rows.sort(key=_sort_key)
 
-        # State sort order: Active first, then Staged, then Auto-connect
-        _state_order = {"Active": 0, "Staged": 1, "Auto-connect": 2}
-        right_rows.sort(key=lambda r: (_state_order.get(r["state"], 9), r["label"]))
+        # Preserve current selection across rebuild
+        prev_selected: Optional[str] = None
+        for item in self._right.selectedItems():
+            data = item.data(Qt.UserRole)
+            if isinstance(data, dict):
+                prev_selected = data.get("label")
+                break
 
         self._right.setSortingEnabled(False)
         self._right.setRowCount(len(right_rows))
+
         for trow, r in enumerate(right_rows):
-            def _item(txt, align=Qt.AlignLeft, num=False, _row=trow, _r=r):
-                it = _NumericItem(str(txt)) if num else QTableWidgetItem(str(txt))
+            active  = r["active"]
+            staged  = r["staged"]
+            ac      = r["ac"]
+            label   = r["label"]
+            st_text = _combined_state(active, staged, ac)
+            st_fg   = _state_fg(active, staged, ac)
+
+            # Tooltip on the State cell
+            tip_parts: List[str] = []
+            if active:
+                tip_parts.append("Live: currently in production subscriptions.")
+            else:
+                tip_parts.append("Not currently connected.")
+                if safe:
+                    tip_parts.append(
+                        "Safe Mode active: this root is not connected even if "
+                        "staged or auto-connect."
+                    )
+            if staged:
+                tip_parts.append("Staged: selected for future production use.")
+            if ac:
+                tip_parts.append(
+                    "Auto-connect: will connect automatically when Normal Mode is enabled."
+                )
+            state_tip = "\n".join(tip_parts)
+
+            row_data = {
+                "label":    label,
+                "active":   active,
+                "staged":   staged,
+                "ac":       ac,
+                "sub_type": r["sub_type"],
+            }
+
+            def _item(txt, align=Qt.AlignLeft, _data=row_data):
+                it = QTableWidgetItem(str(txt))
                 it.setTextAlignment(align | Qt.AlignVCenter)
                 it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                it.setData(Qt.UserRole, _r["sub_key"])
+                it.setData(Qt.UserRole, _data)
                 return it
 
-            state_item = _item(r["state"], Qt.AlignHCenter)
-            # Color-code state: Active=green, Staged=amber, Auto-connect=blue
-            if r["state"] == "Active":
-                state_item.setForeground(QColor("#1a7a1a"))
-            elif r["state"] == "Staged":
-                state_item.setForeground(QColor("#8a5a00"))
-            else:
-                state_item.setForeground(QColor("#1a4a8a"))
+            state_item = _item(st_text, Qt.AlignHCenter)
+            state_item.setForeground(QColor(st_fg))
+            state_item.setToolTip(state_tip)
 
-            self._right.setItem(trow, _R_ROOT, _item(r["label"]))
-            self._right.setItem(trow, _R_STATE, state_item)
+            self._right.setItem(trow, _R_ROOT,   _item(label))
+            self._right.setItem(trow, _R_STATE,  state_item)
+            self._right.setItem(trow, _R_ACTIVE,
+                _item("●" if active else "—", Qt.AlignHCenter))
+            self._right.setItem(trow, _R_STAGED,
+                _item("●" if staged else "—", Qt.AlignHCenter))
             self._right.setItem(trow, _R_AC,
-                _item("●" if r["ac"] else "○", Qt.AlignHCenter))
+                _item("●" if ac else "—", Qt.AlignHCenter))
             self._right.setItem(trow, _R_SUBS,
                 _item("  |  ".join(r["subs"]) if r["subs"] else ""))
             self._right.setItem(trow, _R_PKTS,
-                _item(str(r["pkts"]) if r["pkts"] else "", Qt.AlignRight, num=True))
+                _item(str(r["pkts"]) if r["pkts"] else "", Qt.AlignRight))
             last_str = r["last"].strftime("%H:%M:%S") if r["last"] else ""
             self._right.setItem(trow, _R_LAST, _item(last_str))
-            since_disp = (r["since"] if connected else "disconnected") if r["state"] == "Active" else ""
-            self._right.setItem(trow, _R_SINCE, _item(since_disp))
             self._right.setRowHeight(trow, 20)
 
         self._right.setSortingEnabled(True)
-        n_active  = sum(1 for r in right_rows if r["state"] == "Active")
-        n_staged  = sum(1 for r in right_rows if r["state"] == "Staged")
-        n_ac      = sum(1 for r in right_rows if r["state"] == "Auto-connect")
-        status = "connected" if connected else "disconnected"
-        parts = []
-        if n_active:  parts.append(f"{n_active} active ({status})")
-        if n_staged:  parts.append(f"{n_staged} staged")
-        if n_ac:      parts.append(f"{n_ac} auto-connect")
+
+        # Restore the previous selection if the row label is still present
+        if prev_selected:
+            for row in range(self._right.rowCount()):
+                it = self._right.item(row, _R_ROOT)
+                if it:
+                    data = it.data(Qt.UserRole)
+                    if isinstance(data, dict) and data.get("label") == prev_selected:
+                        self._right.selectRow(row)
+                        break
+
+        n_active = sum(1 for r in right_rows if r["active"])
+        n_staged = sum(1 for r in right_rows if r["staged"] and not r["active"])
+        n_ac     = sum(1 for r in right_rows if r["ac"] and not r["staged"] and not r["active"])
+        status   = "connected" if connected else "disconnected"
+        parts: List[str] = []
+        if n_active: parts.append(f"{n_active} active ({status})")
+        if n_staged: parts.append(f"{n_staged} staged")
+        if n_ac:     parts.append(f"{n_ac} auto-connect")
         self._right_count.setText(
             (", ".join(parts) or "none") + "  (click row to select)"
         )
@@ -648,18 +713,18 @@ class RootManagerDialog(QDialog):
                 roots.append(chk.data(Qt.UserRole))
         return roots
 
-    def _selected_right_items(self) -> List[tuple]:
-        """Return (label, sub_key_type) for every selected row in the right pane.
+    def _selected_right_items(self) -> List[dict]:
+        """Return row-data dicts for every selected row in the right pane.
 
-        sub_key_type can be: "staged", "auto_connect", ROOT_DERIVED, DIRECT, MAP_TYPE, "raw".
+        Each dict has: label, active, staged, ac, sub_type.
         """
         rows = {item.row() for item in self._right.selectedItems()}
         result = []
         for row in sorted(rows):
             it = self._right.item(row, _R_ROOT)
             if it:
-                data = it.data(Qt.UserRole)   # (label, sub_key_type)
-                if data:
+                data = it.data(Qt.UserRole)
+                if isinstance(data, dict):
                     result.append(data)
         return result
 
@@ -669,8 +734,8 @@ class RootManagerDialog(QDialog):
             it = self._right.item(row, _R_ROOT)
             if it:
                 data = it.data(Qt.UserRole)
-                if data:
-                    labels.append(data[0])
+                if isinstance(data, dict):
+                    labels.append(data["label"])
         return labels
 
     # ── actions: Stage / Add  ─────────────────────────────────────────────────
@@ -730,8 +795,8 @@ class RootManagerDialog(QDialog):
         self._refresh()
 
     def _act_remove(self) -> None:
-        """Unstage (Safe Baseline Mode) or unsubscribe (Normal Mode) selected right-pane roots."""
-        items = self._selected_right_items()   # [(label, sub_key_type), ...]
+        """Unstage / clear auto-connect (Safe Mode) or unsubscribe (Normal Mode)."""
+        items = self._selected_right_items()
         if not items:
             _safe = getattr(self._app, "safe_mode", False)
             verb  = "← Unstage" if _safe else "← Remove"
@@ -744,20 +809,39 @@ class RootManagerDialog(QDialog):
         _safe = getattr(self._app, "safe_mode", False)
 
         if _safe:
-            for label, sub_key_type in items:
-                if sub_key_type == "staged":
+            for item in items:
+                label = item["label"]
+                if item["active"]:
+                    # Production feeds cannot be removed in Safe Mode
+                    self._app.window.log(
+                        f"Safe Mode: {label!r} is an active subscription — cannot remove."
+                    )
+                    continue
+                if item["staged"]:
                     self._app.storage.set_root_staged(label, False)
                     self._app.window.log(f"Root unstaged: {label}")
-                elif sub_key_type == "auto_connect":
+                elif item["ac"]:
                     self._app.storage.set_root_auto_connect(label, False)
                     self._app.window.log(f"Auto-connect cleared: {label}")
-                # Active subs (DIRECT, MAP_TYPE, etc.) are not removable in Safe Baseline Mode
         else:
             db_by_root = {r["root_topic"]: r
                           for r in self._app.storage.get_all_mqtt_roots()}
 
-            for label, sub_key_type in items:
-                if sub_key_type == ROOT_DERIVED:
+            for item in items:
+                label    = item["label"]
+                sub_type = item["sub_type"]
+
+                if not item["active"]:
+                    # Not live — just clear staging/AC flags
+                    if item["staged"]:
+                        self._app.storage.set_root_staged(label, False)
+                        self._app.window.log(f"Root unstaged: {label}")
+                    if item["ac"]:
+                        self._app.storage.set_root_auto_connect(label, False)
+                        self._app.window.log(f"Auto-connect cleared: {label}")
+                    continue
+
+                if sub_type == ROOT_DERIVED:
                     db_row = db_by_root.get(label, {})
                     if db_row.get("auto_connect"):
                         reply = QMessageBox.question(
@@ -773,34 +857,19 @@ class RootManagerDialog(QDialog):
                             self._app.storage.set_root_auto_connect(label, False)
                     self._app.unsubscribe_root(label)
 
-                elif sub_key_type == DIRECT:
-                    reply = QMessageBox.question(
-                        self, "Remove Direct Subscription?",
+                elif sub_type == DIRECT:
+                    QMessageBox.information(
+                        self, "Direct Subscription",
                         f"'{label}' is the base direct subscription for the JSON source.\n\n"
-                        "Remove it? (Root-derived subscriptions will still work.)",
-                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                        "To change it, use Edit Source in the source panel.",
                     )
-                    if reply == QMessageBox.Yes:
-                        self._app.source_manager.unsubscribe_topics([label])
-                        cfg = self._app.source_manager.get_config(SOURCE_MQTT_JSON)
-                        if cfg and cfg.topic == label:
-                            cfg.topic = ""
-                            self._app._save_sources_config()
 
-                elif sub_key_type in (MAP_TYPE, "map"):
+                elif sub_type in (MAP_TYPE, "map"):
                     QMessageBox.information(
                         self, "Map Source",
                         f"'{label}' is the Map Reports base subscription.\n\n"
                         "To disable it, uncheck the Map Reports source in the source panel.",
                     )
-
-                elif sub_key_type == "staged":
-                    self._app.storage.set_root_staged(label, False)
-                    self._app.window.log(f"Root unstaged: {label}")
-
-                elif sub_key_type == "auto_connect":
-                    self._app.storage.set_root_auto_connect(label, False)
-                    self._app.window.log(f"Auto-connect cleared: {label}")
 
         self._refresh()
 
@@ -845,7 +914,8 @@ class RootManagerDialog(QDialog):
             QMessageBox.information(self, "Nothing Selected",
                 "Click a row in the right pane first.")
             return
-        for label, _ in items:
+        for item in items:
+            label = item["label"]
             self._app.storage.set_root_auto_connect(label, True)
             self._app.window.log(f"Auto-connect enabled: {label}")
         self._app._save_sources_config()
@@ -857,7 +927,8 @@ class RootManagerDialog(QDialog):
             QMessageBox.information(self, "Nothing Selected",
                 "Click a row in the right pane first.")
             return
-        for label, _ in items:
+        for item in items:
+            label = item["label"]
             self._app.storage.set_root_auto_connect(label, False)
             self._app.window.log(f"Auto-connect cleared: {label}")
         self._app._save_sources_config()
