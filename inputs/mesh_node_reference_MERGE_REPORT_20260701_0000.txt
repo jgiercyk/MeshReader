@@ -1,0 +1,34 @@
+Mesh Command Post — Node Reference Merge Report
+Generated : 2026-07-01 00:00:50
+
+── Input files ──────────────────────────────────────────────────────
+  Older : mesh_node_reference_20260630_2126(1).csv  (303 nodes)
+  Newer : mesh_node_reference_20260630_2323.csv  (525 nodes)
+
+── Merge results ────────────────────────────────────────────────────
+  Merged node count           : 525
+  Nodes from newer only       : 222
+  Nodes from older only       : 0  ← recovered
+  Nodes present in both       : 303
+  Positions restored from old : 134
+  Identity fields filled      : 0
+  Bad positions rejected      : 1
+  Distance fields cleared     : 525  (recalculated by app)
+  Node records DELETED        : 0  ← no records are ever deleted
+
+── Output files ─────────────────────────────────────────────────────
+  Merged CSV : C:\Users\jim\MQTTReader\mesh-command-post\inputs\mesh_node_reference_MERGED_20260701_0000.csv
+  Report     : C:\Users\jim\MQTTReader\mesh-command-post\inputs\mesh_node_reference_MERGE_REPORT_20260701_0000.txt
+
+── Database ─────────────────────────────────────────────────────────
+  Backup     : C:\Users\jim\MQTTReader\mesh-command-post\backups\node_database_before_merge_20260701_000050.db
+  Nodes added to DB    : 0
+  Nodes updated in DB  : 525
+  Nodes deleted from DB: 0
+
+── Acceptance notes ─────────────────────────────────────────────────
+  - The current database was not rolled back.
+  - Newer node data was preserved; older filled missing records only.
+  - Distance is NOT imported — app recalculates from home coordinates.
+  - Nodes without valid lat/lon will not appear on the map.
+  - Identity-only MAP nodes remain in the Nodes tab without markers.
