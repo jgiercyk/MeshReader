@@ -4,7 +4,7 @@ import traceback
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
@@ -40,7 +40,6 @@ class SourcePanel(QGroupBox):
         super().__init__("MQTT Sources", parent)
         self._sm  = source_manager
         self._app = app
-        self._disc_active = False
         # Per-source non-connected status: tag → (text, color)
         # Set by signal handler; read by _refresh_stats when not connected.
         self._force_status: Dict[str, tuple] = {}
@@ -52,6 +51,7 @@ class SourcePanel(QGroupBox):
         self._refresh_timer.start()
         self._rebuild_rows()
         self._refresh_subs_label()
+        self._wire_discovery_signals()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -234,21 +234,47 @@ class SourcePanel(QGroupBox):
 
     # ── Discovery ────────────────────────────────────────────────────────────
 
-    def _on_discover(self) -> None:
-        if self._app is None or self._disc_active:
+    def _wire_discovery_signals(self) -> None:
+        if self._app is None:
             return
-        dur = self._app.config.discovery_duration_seconds
-        ok = self._app.start_discovery(duration_sec=dur)
-        if ok:
-            self._disc_active = True
-            self._disc_btn.setEnabled(False)
-            self._disc_label.setText(f"Scanning {dur}s…")
-            QTimer.singleShot((dur + 5) * 1000, self._reset_disc_btn)
+        self._app.discovery_started.connect(self._on_disc_started)
+        self._app.discovery_tick.connect(self._on_disc_tick)
+        self._app.discovery_finished.connect(self._on_disc_finished)
+        self._app.discovery_stopped.connect(self._on_disc_stopped)
+        # Sync state if discovery was already running when the panel was created
+        if getattr(self._app, "disc_running", False):
+            dur = getattr(self._app, "disc_duration_sec", 60)
+            self._disc_btn.setText("Stop Discovery")
+            self._disc_label.setText(f"{dur}s…")
 
-    def _reset_disc_btn(self) -> None:
-        self._disc_active = False
-        self._disc_btn.setEnabled(True)
-        self._disc_label.setText("")
+    def _on_discover(self) -> None:
+        if self._app is None:
+            return
+        if getattr(self._app, "disc_running", False):
+            self._app.stop_discovery()
+        else:
+            dur = self._app.config.discovery_duration_seconds
+            self._app.start_discovery(duration_sec=dur)
+
+    @Slot(str, int)
+    def _on_disc_started(self, topic: str, duration: int) -> None:
+        self._disc_btn.setText("Stop Discovery")
+        self._disc_label.setText(f"{duration}s…")
+
+    @Slot(int, int, int)
+    def _on_disc_tick(self, remaining: int, roots: int, packets: int) -> None:
+        self._disc_label.setText(f"{remaining}s — {roots} root(s), {packets} pkt(s)")
+
+    @Slot(int, int)
+    def _on_disc_finished(self, roots: int, packets: int) -> None:
+        self._disc_btn.setText("Discover Now")
+        self._disc_label.setText(f"Done: {roots} root(s)")
+        self._refresh_subs_label()
+
+    @Slot()
+    def _on_disc_stopped(self) -> None:
+        self._disc_btn.setText("Discover Now")
+        self._disc_label.setText("Stopped")
         self._refresh_subs_label()
 
     def _on_topic_probe(self) -> None:

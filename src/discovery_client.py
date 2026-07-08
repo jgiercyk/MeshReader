@@ -90,6 +90,13 @@ class DiscoveryClient:
             self._timer = None
         self._kill_client(reason="cancelled")
 
+    def get_counts(self) -> tuple:
+        """Return (n_roots, n_packets) as a thread-safe snapshot."""
+        with self._lock:
+            n_roots   = len(self._roots)
+            n_packets = sum(d["packet_count"] for d in self._roots.values())
+        return n_roots, n_packets
+
     # ── internals ─────────────────────────────────────────────────────────────
 
     def _kill_client(self, reason: str = "") -> None:

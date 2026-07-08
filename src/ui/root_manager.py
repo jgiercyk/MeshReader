@@ -91,7 +91,6 @@ class RootManagerDialog(QDialog):
     def __init__(self, app, parent=None):
         super().__init__(parent)
         self._app = app
-        self._disc_count = 0   # roots found since last Discover click
         self.setWindowTitle("Root Topic Manager")
         self.setMinimumSize(1200, 580)
         self._build_ui()
@@ -101,18 +100,37 @@ class RootManagerDialog(QDialog):
         self._timer.setInterval(3000)
         self._timer.timeout.connect(self._refresh)
         self._timer.start()
-        # Connect to discovery_result so we refresh after a discovery run
+        # Connect to discovery signals
         try:
             app.discovery_result.connect(self._on_discovery_result)
+            app.discovery_started.connect(self._on_disc_started)
+            app.discovery_tick.connect(self._on_disc_tick)
+            app.discovery_finished.connect(self._on_disc_finished)
+            app.discovery_stopped.connect(self._on_disc_stopped)
             self._disc_connected = True
         except Exception:
             self._disc_connected = False
+        # Sync button/label if discovery is already running when dialog opens
+        if getattr(app, "disc_running", False):
+            import time as _time
+            started_at = getattr(app, "disc_started_at", None)
+            dur        = getattr(app, "disc_duration_sec", 60)
+            if started_at is not None:
+                remaining = max(0, dur - int(_time.monotonic() - started_at))
+                self._disc_lbl.setText(f"{remaining}s…")
+            else:
+                self._disc_lbl.setText(f"{dur}s…")
+            self._disc_btn.setText("Stop Discovery")
 
     def closeEvent(self, event) -> None:
         self._timer.stop()
         if self._disc_connected:
             try:
                 self._app.discovery_result.disconnect(self._on_discovery_result)
+                self._app.discovery_started.disconnect(self._on_disc_started)
+                self._app.discovery_tick.disconnect(self._on_disc_tick)
+                self._app.discovery_finished.disconnect(self._on_disc_finished)
+                self._app.discovery_stopped.disconnect(self._on_disc_stopped)
             except Exception:
                 pass
         self._app.window.log("Root Manager closed")
@@ -909,24 +927,33 @@ class RootManagerDialog(QDialog):
         self._refresh()
 
     def _act_discover(self) -> None:
-        if self._app._disc_client and self._app._disc_client.running:
-            QMessageBox.information(self, "Discovery Running",
-                "A discovery scan is already in progress.")
-            return
-        dur = self._app.config.discovery_duration_seconds
-        self._app.start_discovery(duration_sec=dur)
-        self._disc_btn.setEnabled(False)
-        self._disc_lbl.setText(f"Scanning {dur}s…")
-        self._disc_count = 0
-        QTimer.singleShot((dur + 8) * 1000, self._discovery_finished)
+        if getattr(self._app, "disc_running", False):
+            self._app.stop_discovery()
+        else:
+            dur = self._app.config.discovery_duration_seconds
+            self._app.start_discovery(duration_sec=dur)
 
-    def _discovery_finished(self) -> None:
-        self._disc_btn.setEnabled(True)
-        self._disc_lbl.setText("")
+    @Slot(str, int)
+    def _on_disc_started(self, topic: str, duration: int) -> None:
+        self._disc_btn.setText("Stop Discovery")
+        self._disc_lbl.setText(f"{duration}s…")
+
+    @Slot(int, int, int)
+    def _on_disc_tick(self, remaining: int, roots: int, packets: int) -> None:
+        self._disc_lbl.setText(f"{remaining}s — {roots} root(s), {packets} pkt(s)")
+
+    @Slot(int, int)
+    def _on_disc_finished(self, roots: int, packets: int) -> None:
+        self._disc_btn.setText("Discover Now")
+        self._disc_lbl.setText(f"Found {roots} root(s)")
+        self._refresh()
+
+    @Slot()
+    def _on_disc_stopped(self) -> None:
+        self._disc_btn.setText("Discover Now")
+        self._disc_lbl.setText("Stopped")
         self._refresh()
 
     @Slot(dict)
     def _on_discovery_result(self, result: dict) -> None:
-        self._disc_count = len(result)
-        self._disc_lbl.setText(f"Found {self._disc_count} root(s)")
         self._refresh()
