@@ -71,6 +71,8 @@ class App(QObject):
     discovery_tick     = Signal(int, int, int)  # remaining_sec, roots_found, packets_seen
     discovery_finished = Signal(int, int)       # roots_found, packets_seen
     discovery_stopped  = Signal()
+    # Emitted when test root subscriptions are added (True) or all removed (False)
+    test_mode_changed  = Signal(bool)
 
     def __init__(self):
         super().__init__()
@@ -166,6 +168,9 @@ class App(QObject):
         self.disc_roots_found:  int             = 0
         self.disc_packets_seen: int             = 0
         self._disc_was_stopped: bool            = False
+        # Test root subscriptions — added on top of the two baseline feeds.
+        # Never populated at startup; only via test_subscribe_root().
+        self._test_roots: List[str] = []
         # Single countdown timer — 1 s interval, Qt main thread only
         self._disc_countdown_timer = QTimer(self)
         self._disc_countdown_timer.setInterval(1000)
@@ -372,11 +377,16 @@ class App(QObject):
         now = datetime.now()
         for tag in (SOURCE_MQTT_JSON, SOURCE_MQTT_MAP):
             self.source_manager.set_connected(tag, True, now)
-        # Register the two subscriptions as the authoritative live subs
+        # Register the two baseline subscriptions as the authoritative live subs
         self.sub_registry.clear_all()
         from subscription_registry import DIRECT, MAP_TYPE
         self.sub_registry.register(JSON_TOPIC, SOURCE_MQTT_JSON, DIRECT)
         self.sub_registry.register(MAP_TOPIC,  SOURCE_MQTT_MAP,  MAP_TYPE)
+        # Re-register any test root subscriptions (paho already re-subscribed them)
+        for root in self._test_roots:
+            derived = f"{root}/2/json/#"
+            self.sub_registry.register(derived, SOURCE_MQTT_JSON, ROOT_DERIVED, root)
+            logging.info("Production MQTT: re-registered test root  %s", derived)
         # Refresh the live subs label in the source panel
         sp = getattr(self.window, "_source_panel", None)
         if sp:
@@ -400,6 +410,66 @@ class App(QObject):
         """Forward ProductionMqttClient status to both source panel rows."""
         self.source_manager.source_status_changed.emit(SOURCE_MQTT_JSON, text)
         self.source_manager.source_status_changed.emit(SOURCE_MQTT_MAP,  text)
+
+    # ── Controlled test-root subscriptions ────────────────────────────────────
+    # These add a single derived topic (root/2/json/#) on top of the two
+    # baseline feeds without touching SAFE_MODE_MQTT or the source_manager workers.
+
+    def test_subscribe_root(self, root: str) -> bool:
+        """Subscribe to one additional root on the production connection for testing.
+
+        Derives the topic as '{root}/2/json/#' and adds it to the live paho
+        connection.  Registers in sub_registry so Root Manager shows it as Active.
+        Safe to call while connected or before connection (queued for next connect).
+        Returns True if subscription was sent to the broker.
+        """
+        if root in self._test_roots:
+            self.window.log(f"Test root already active: {root}")
+            return True
+        derived = f"{root}/2/json/#"
+        sent = self._prod_mqtt.subscribe_extra(derived)
+        self.sub_registry.register(derived, SOURCE_MQTT_JSON, ROOT_DERIVED, root)
+        self._test_roots.append(root)
+        self.window.log(
+            f"Test subscribe: {derived}"
+            + ("  ✓ sent to broker" if sent else "  (queued — will send on connect)")
+        )
+        logging.info(
+            "test_subscribe_root: root=%s  derived=%s  connected=%s  sent=%s",
+            root, derived, self._prod_mqtt.connected, sent,
+        )
+        sp = getattr(self.window, "_source_panel", None)
+        if sp:
+            sp._refresh_subs_label()
+        self.test_mode_changed.emit(True)
+        return sent
+
+    def test_unsubscribe_root(self, root: str) -> None:
+        """Remove a test root subscription from the production connection."""
+        derived = f"{root}/2/json/#"
+        self._prod_mqtt.unsubscribe_extra(derived)
+        self.sub_registry.unregister(derived)
+        if root in self._test_roots:
+            self._test_roots.remove(root)
+        self.window.log(f"Test unsubscribed: {derived}")
+        logging.info("test_unsubscribe_root: root=%s  derived=%s", root, derived)
+        sp = getattr(self.window, "_source_panel", None)
+        if sp:
+            sp._refresh_subs_label()
+        if not self._test_roots:
+            self.test_mode_changed.emit(False)
+
+    def rollback_to_safe_baseline(self) -> None:
+        """Remove all test root subscriptions and return to Safe Baseline Mode."""
+        if not self._test_roots:
+            self.window.log("Already at Safe Baseline — no test roots to remove.")
+            return
+        for root in list(self._test_roots):
+            self.test_unsubscribe_root(root)
+        self.window.log(
+            "Rolled back to Safe Baseline Mode.  "
+            "Live subscriptions: msh/US/2/json/#  msh/US/2/map/#"
+        )
 
     # ── discovery ─────────────────────────────────────────────────────────────
 

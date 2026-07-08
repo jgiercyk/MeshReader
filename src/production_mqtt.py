@@ -17,7 +17,7 @@ import os
 import random
 import threading
 import traceback
-from typing import Optional
+from typing import List, Optional
 
 import paho.mqtt.client as mqtt_lib
 from PySide6.QtCore import QObject, Signal
@@ -76,8 +76,13 @@ class ProductionMqttClient(QObject):
         self._stop     = threading.Event()
         self._disc_evt = threading.Event()
         self._conn_evt = threading.Event()   # set in _cb_connect (success or fail)
-        self.connected = False
+        self.connected  = False
         self._client_id = self._fresh_id()
+        # Live paho client — set while _connect_once() is running, None otherwise.
+        # subscribe_extra / unsubscribe_extra use this for dynamic subscriptions.
+        self._client: Optional[mqtt_lib.Client] = None
+        # Extra subscriptions beyond JSON_TOPIC / MAP_TOPIC; re-applied every reconnect.
+        self._extra_subs: List[str] = []
 
     # ── public API ─────────────────────────────────────────────────────────────
 
@@ -141,8 +146,47 @@ class ProductionMqttClient(QObject):
         self.status_changed.emit("Disconnected")
         logging.info("Production MQTT: worker thread exiting")
 
+    def subscribe_extra(self, topic: str) -> bool:
+        """Dynamically subscribe to one additional topic on the live connection.
+
+        Thread-safe (paho subscribe is thread-safe).  If not currently connected,
+        the topic is queued and sent on the next successful reconnect.
+        Returns True if subscription was sent to the broker, False if only queued.
+        """
+        if topic in self._extra_subs:
+            return self.connected
+        self._extra_subs.append(topic)
+        client = self._client
+        if client is not None and self.connected:
+            try:
+                res, mid = client.subscribe(topic)
+                logging.info(
+                    "Production MQTT: subscribe_extra  %s  res=%d  mid=%d", topic, res, mid
+                )
+                self.log_message.emit(f"  subscribed (test): {topic}  (res={res} mid={mid})")
+                return True
+            except Exception as exc:
+                logging.error("subscribe_extra(%r): %s", topic, exc)
+        return False
+
+    def unsubscribe_extra(self, topic: str) -> None:
+        """Remove a dynamic subscription and unsubscribe from the broker if connected."""
+        if topic in self._extra_subs:
+            self._extra_subs.remove(topic)
+        client = self._client
+        if client is not None:
+            try:
+                client.unsubscribe(topic)
+                logging.info("Production MQTT: unsubscribe_extra  %s", topic)
+                self.log_message.emit(f"  unsubscribed (test): {topic}")
+            except Exception as exc:
+                logging.error("unsubscribe_extra(%r): %s", topic, exc)
+
+    # ── worker thread ───────────────────────────────────────────────────────────
+
     def _connect_once(self) -> None:
         client = _make_client(self._client_id)
+        self._client = client
 
         if self._username:
             client.username_pw_set(self._username, self._password)
@@ -192,6 +236,7 @@ class ProductionMqttClient(QObject):
 
         # All cleanup on the worker thread — never on the caller's thread
         self.connected = False
+        self._client   = None   # prevent main-thread subscribe_extra calls on dead client
         try:
             client.disconnect()
         except Exception:
@@ -222,6 +267,19 @@ class ProductionMqttClient(QObject):
                     topic, res, mid,
                 )
                 self.log_message.emit(f"  subscribed: {topic}  (res={res} mid={mid})")
+
+            for topic in self._extra_subs:
+                try:
+                    res, mid = client.subscribe(topic)
+                    logging.info(
+                        "Production MQTT: subscribe_extra(reconnect)  %s  res=%d  mid=%d",
+                        topic, res, mid,
+                    )
+                    self.log_message.emit(
+                        f"  subscribed (test/reconnect): {topic}  (res={res} mid={mid})"
+                    )
+                except Exception as exc:
+                    logging.error("subscribe_extra reconnect %r: %s", topic, exc)
 
             self.status_changed.emit("Connected")
             self.connected_event.emit(self._client_id)

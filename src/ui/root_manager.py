@@ -127,6 +127,13 @@ class RootManagerDialog(QDialog):
             self._disc_connected = True
         except Exception:
             self._disc_connected = False
+
+        # Connect test_mode_changed to update the Rollback button enable state
+        try:
+            app.test_mode_changed.connect(self._on_test_mode_changed)
+            self._test_connected = True
+        except Exception:
+            self._test_connected = False
         # Sync button/label if discovery is already running when dialog opens
         if getattr(app, "disc_running", False):
             import time as _time
@@ -148,6 +155,11 @@ class RootManagerDialog(QDialog):
                 self._app.discovery_tick.disconnect(self._on_disc_tick)
                 self._app.discovery_finished.disconnect(self._on_disc_finished)
                 self._app.discovery_stopped.disconnect(self._on_disc_stopped)
+            except Exception:
+                pass
+        if getattr(self, "_test_connected", False):
+            try:
+                self._app.test_mode_changed.disconnect(self._on_test_mode_changed)
             except Exception:
                 pass
         self._app.window.log("Root Manager closed")
@@ -202,17 +214,21 @@ class RootManagerDialog(QDialog):
 
         if _safe:
             _btn_defs = [
-                ("Stage →",        "Mark checked available roots as Staged (ready for future production)",
+                ("Stage →",           "Mark checked available roots as Staged (ready for future production)",
                  self._act_add),
-                ("← Unstage",      "Remove selected staged/auto-connect roots from the right pane",
+                ("← Unstage",         "Remove selected staged/auto-connect roots from the right pane",
                  self._act_remove),
-                ("Stage Top 10 →", "Stage the 10 busiest available roots",
+                ("Test Subscribe →",  "Subscribe the selected staged/auto-connect root on the live\n"
+                                      "production connection for a controlled test.\n"
+                                      "Adds only {root}/2/json/# — no other topics.",
+                 self._act_test_subscribe),
+                ("Stage Top 10 →",    "Stage the 10 busiest available roots",
                  lambda: self._act_add_top(10)),
-                ("Stage Top 20 →", "Stage the 20 busiest available roots",
+                ("Stage Top 20 →",    "Stage the 20 busiest available roots",
                  lambda: self._act_add_top(20)),
-                ("Stage Top 50 →", "Stage the 50 busiest available roots",
+                ("Stage Top 50 →",    "Stage the 50 busiest available roots",
                  lambda: self._act_add_top(50)),
-                ("Clear Staged",   "Remove all staged roots from the right pane",
+                ("Clear Staged",      "Remove all staged roots from the right pane",
                  self._act_remove_all),
             ]
         else:
@@ -323,6 +339,25 @@ class RootManagerDialog(QDialog):
             b.setToolTip(tip)
             b.clicked.connect(slot)
             bar.addWidget(b)
+
+        # Rollback button — visible in Safe Mode; enabled only when test roots are active
+        if getattr(self._app, "safe_mode", False):
+            self._rollback_btn = QPushButton("Rollback to Safe Baseline")
+            self._rollback_btn.setFixedHeight(24)
+            self._rollback_btn.setEnabled(bool(getattr(self._app, "_test_roots", [])))
+            self._rollback_btn.setToolTip(
+                "Remove all test root subscriptions and return to exactly:\n"
+                "  msh/US/2/json/#\n"
+                "  msh/US/2/map/#"
+            )
+            self._rollback_btn.setStyleSheet(
+                "QPushButton { color: #7a1a00; font-weight: bold; }"
+                "QPushButton:enabled { background: #fff0e8; border: 1px solid #c0400a; }"
+            )
+            self._rollback_btn.clicked.connect(self._act_rollback_safe)
+            bar.addWidget(self._rollback_btn)
+        else:
+            self._rollback_btn = None
 
         bar.addStretch()
 
@@ -933,6 +968,68 @@ class RootManagerDialog(QDialog):
             self._app.window.log(f"Auto-connect cleared: {label}")
         self._app._save_sources_config()
         self._refresh()
+
+    @Slot(bool)
+    def _on_test_mode_changed(self, active: bool) -> None:
+        """Enable/disable the Rollback button when test roots are added or removed."""
+        if self._rollback_btn is not None:
+            self._rollback_btn.setEnabled(active)
+        self._refresh()
+
+    def _act_test_subscribe(self) -> None:
+        """Subscribe the selected staged/auto-connect root on the live production connection."""
+        items = self._selected_right_items()
+        # Only allow roots that are NOT already active
+        candidates = [it for it in items if not it["active"]]
+        if not candidates:
+            QMessageBox.information(
+                self, "Select a Staged or Auto-Connect Root",
+                "Click a row in the right pane that is NOT already active, "
+                "then click 'Test Subscribe →'.\n\n"
+                "Only staged or auto-connect roots can be test-subscribed."
+            )
+            return
+        for item in candidates:
+            root = item["label"]
+            # Only ROOT_DERIVED topics make sense; skip DIRECT / MAP_TYPE entries
+            if item.get("sub_type") not in ("root", ROOT_DERIVED, None, "auto_connect", "staged"):
+                QMessageBox.information(
+                    self, "Cannot Test-Subscribe",
+                    f"'{root}' is a direct subscription or map topic — not a root."
+                )
+                continue
+            ok = self._app.test_subscribe_root(root)
+            if not ok and not self._app._prod_mqtt.connected:
+                QMessageBox.warning(
+                    self, "Not Connected",
+                    f"Test subscription for '{root}' was queued but the broker "
+                    "is not currently connected.\n\n"
+                    "The subscription will be sent automatically when the connection is restored."
+                )
+        self._refresh()
+
+    def _act_rollback_safe(self) -> None:
+        """Remove all test subscriptions and restore the Safe Baseline."""
+        test_roots = list(getattr(self._app, "_test_roots", []))
+        if not test_roots:
+            QMessageBox.information(
+                self, "Already at Safe Baseline",
+                "No test root subscriptions are active."
+            )
+            return
+        reply = QMessageBox.question(
+            self, "Rollback to Safe Baseline?",
+            f"Remove all test root subscriptions?\n\n"
+            f"Roots to unsubscribe: {', '.join(test_roots)}\n\n"
+            f"Live subscriptions after rollback:\n"
+            f"  msh/US/2/json/#\n"
+            f"  msh/US/2/map/#",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            self._app.rollback_to_safe_baseline()
+            self._refresh()
 
     def _act_save_defaults(self) -> None:
         active_roots = list(self._app.sub_registry.get_active_roots())
