@@ -21,3 +21,4 @@ backups/
 *.pem
 .vscode/
 .idea/
+.git-old-bloated-backup_*/
